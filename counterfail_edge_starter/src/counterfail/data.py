@@ -1,0 +1,132 @@
+import json
+import random
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import torch
+from PIL import Image, ImageFilter
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+
+def read_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_vocab(path: str) -> Dict[str, int]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+
+
+def encode_text(text: str, vocab: Dict[str, int], max_len: int = 64) -> torch.Tensor:
+    ids = [vocab.get(tok, vocab.get("<unk>", 1)) for tok in tokenize(text)[:max_len]]
+    if not ids:
+        ids = [vocab.get("<unk>", 1)]
+    return torch.tensor(ids, dtype=torch.long)
+
+
+class RandomOcclusion:
+    def __init__(self, p: float = 0.25, min_frac: float = 0.08, max_frac: float = 0.25):
+        self.p = p
+        self.min_frac = min_frac
+        self.max_frac = max_frac
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        img = img.copy()
+        w, h = img.size
+        occ_w = int(w * random.uniform(self.min_frac, self.max_frac))
+        occ_h = int(h * random.uniform(self.min_frac, self.max_frac))
+        x0 = random.randint(0, max(0, w - occ_w))
+        y0 = random.randint(0, max(0, h - occ_h))
+        # Fill with mean-ish gray without requiring numpy.
+        patch = Image.new("RGB", (occ_w, occ_h), (127, 127, 127))
+        img.paste(patch, (x0, y0))
+        return img
+
+
+class RandomBlur:
+    def __init__(self, p: float = 0.15, radius: float = 1.2):
+        self.p = p
+        self.radius = radius
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        return img.filter(ImageFilter.GaussianBlur(radius=self.radius))
+
+
+def make_transforms(img_size: int, train: bool):
+    aug = []
+    if train:
+        aug += [
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.08, hue=0.02),
+            RandomOcclusion(p=0.20),
+            RandomBlur(p=0.10),
+        ]
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        *aug,
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+class PairInstructionDataset(Dataset):
+    def __init__(self, jsonl: str, vocab: Dict[str, int], img_size: int = 224, train: bool = False, max_text_len: int = 64):
+        self.rows = read_jsonl(jsonl)
+        self.vocab = vocab
+        self.tf = make_transforms(img_size, train=train)
+        self.max_text_len = max_text_len
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _load_image(self, path: str) -> torch.Tensor:
+        img = Image.open(path).convert("RGB")
+        return self.tf(img)
+
+    def __getitem__(self, idx: int):
+        r = self.rows[idx]
+        before = self._load_image(r["before"])
+        after = self._load_image(r["after"])
+        text_ids = encode_text(r.get("instruction", ""), self.vocab, max_len=self.max_text_len)
+        label = torch.tensor(float(r["label"]), dtype=torch.float32)
+        return {
+            "before": before,
+            "after": after,
+            "text_ids": text_ids,
+            "label": label,
+            "failure_type": r.get("failure_type", ""),
+            "source": r.get("source", ""),
+        }
+
+
+def collate_fn(batch: List[dict]) -> dict:
+    before = torch.stack([b["before"] for b in batch], dim=0)
+    after = torch.stack([b["after"] for b in batch], dim=0)
+    labels = torch.stack([b["label"] for b in batch], dim=0)
+    text_lens = torch.tensor([len(b["text_ids"]) for b in batch], dtype=torch.long)
+    text_ids = pad_sequence([b["text_ids"] for b in batch], batch_first=True, padding_value=0)
+    return {
+        "before": before,
+        "after": after,
+        "text_ids": text_ids,
+        "text_lens": text_lens,
+        "label": labels,
+        "failure_type": [b["failure_type"] for b in batch],
+        "source": [b["source"] for b in batch],
+    }
