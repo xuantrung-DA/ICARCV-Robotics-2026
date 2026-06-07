@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -88,7 +88,7 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = GradScaler(device.type, enabled=args.amp and device.type == "cuda")
 
     best_f1 = -1.0
     history = []
@@ -107,7 +107,7 @@ def main():
             labels = batch["label"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=args.amp and device.type == "cuda"):
+            with autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
                 logits, pair_z, text_z = model(before, after, text_ids, text_lens)
                 bce = F.binary_cross_entropy_with_logits(logits, labels)
                 con = contrastive_loss(pair_z, text_z, labels)

@@ -78,17 +78,38 @@ def choose_before_after(image_paths: List[str], preferred_view: str = "viewpoint
     return starts[0], ends[0]
 
 
+def _resolve_image_path(repo_dir: Path, rel_path: str) -> Optional[Path]:
+    """Resolve an image path from metadata, handling prefix mismatches.
+
+    Metadata may store paths like 'data/failure_forge/data/.../records/...'
+    but after tar extraction, images land directly under 'records/' in repo_dir.
+    Try the literal path first, then strip the prefix up to 'records/'.
+    """
+    candidate = repo_dir / rel_path
+    if candidate.exists():
+        return candidate
+    # Strip everything before 'records/' and retry.
+    parts = rel_path.replace("\\", "/").split("/")
+    for i, part in enumerate(parts):
+        if part == "records":
+            short = "/".join(parts[i:])
+            candidate = repo_dir / short
+            if candidate.exists():
+                return candidate
+            break
+    return None
+
+
 def normalize_sample(raw: dict, repo_dir: Path, source: str, split: str, preferred_view: str) -> Optional[dict]:
     images = raw.get("images") or []
     before_rel, after_rel = choose_before_after(images, preferred_view=preferred_view)
     if not before_rel or not after_rel:
         return None
 
-    before = repo_dir / before_rel
-    after = repo_dir / after_rel
-    if not before.exists() or not after.exists():
+    before = _resolve_image_path(repo_dir, before_rel)
+    after = _resolve_image_path(repo_dir, after_rel)
+    if not before or not after:
         return None
-
     task_instruction = raw.get("task_instruction") or ""
     subtask = raw.get("detailed_subtask_name") or ""
     instruction = task_instruction.strip()
