@@ -163,7 +163,7 @@ def load_all(raw_root: Path, preferred_view: str) -> List[dict]:
 def make_counterfactuals(success_rows: List[dict], neg_per_pos: int, seed: int) -> List[dict]:
     rng = random.Random(seed)
     rows: List[dict] = []
-    types = ["no_progress", "temporal_reverse", "instruction_mismatch", "after_mismatch"]
+    types = ["no_progress", "temporal_reverse", "instruction_mismatch", "after_mismatch", "visual_corruption"]
 
     by_task = defaultdict(list)
     for r in success_rows:
@@ -197,6 +197,8 @@ def make_counterfactuals(success_rows: List[dict], neg_per_pos: int, seed: int) 
                 candidates = [x for x in success_rows if x.get("taskvar") != r.get("taskvar")]
                 other = rng.choice(candidates or success_rows)
                 neg["after"] = other["after"]
+            elif t == "visual_corruption":
+                neg["corrupt_target"] = rng.choice(["before", "after"])
             rows.append(neg)
     rng.shuffle(rows)
     return rows

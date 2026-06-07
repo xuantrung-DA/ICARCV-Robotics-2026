@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import PairInstructionDataset, collate_fn, load_vocab
-from .metrics import binary_metrics, expected_calibration_error, risk_coverage
+from .metrics import binary_metrics, expected_calibration_error, find_best_threshold, risk_coverage
 from .model import CounterFailNet
 from .paths import resolve_input_path, resolve_output_path
 
@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--use_ckpt_threshold", action="store_true", help="Use validation-selected threshold stored in the checkpoint.")
+    parser.add_argument("--tune_threshold", action="store_true", help="Report the best threshold on this eval split. Use only for analysis, not final test claims.")
+    parser.add_argument("--threshold_metric", choices=["f1", "balanced_acc", "auroc", "auprc"], default="f1")
     parser.add_argument("--save_preds", type=str, default=None)
     args = parser.parse_args()
 
@@ -69,15 +72,21 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     y_true, y_prob, failure_types, sources = run_eval(model, loader, device)
 
-    metrics = binary_metrics(y_true, y_prob, threshold=args.threshold)
+    threshold = float(ckpt.get("best_threshold", args.threshold)) if args.use_ckpt_threshold else args.threshold
+    if args.tune_threshold:
+        metrics = find_best_threshold(y_true, y_prob, metric=args.threshold_metric)
+        threshold = metrics["threshold"]
+    else:
+        metrics = binary_metrics(y_true, y_prob, threshold=threshold)
+        metrics["threshold"] = threshold
     metrics["ece"] = expected_calibration_error(y_true, y_prob)
-    metrics.update(risk_coverage(y_true, y_prob))
+    metrics.update(risk_coverage(y_true, y_prob, threshold=threshold))
     metrics["n"] = int(len(y_true))
     metrics["jsonl"] = str(jsonl_path)
     print(json.dumps(metrics, indent=2))
 
     # Per-failure-type recall on failure samples. Useful for paper table.
-    pred = (y_prob >= args.threshold).astype(int)
+    pred = (y_prob >= threshold).astype(int)
     per_type = {}
     for ft in sorted(set(failure_types)):
         idx = np.array([x == ft for x in failure_types])
@@ -95,7 +104,7 @@ def main():
     if args.save_preds:
         rows = []
         for r, yt, yp, ft, src in zip(ds.rows, y_true.tolist(), y_prob.tolist(), failure_types, sources):
-            rows.append({**r, "y_true": int(yt), "p_success": float(yp), "pred": int(yp >= args.threshold), "failure_type": ft, "source": src})
+            rows.append({**r, "y_true": int(yt), "p_success": float(yp), "pred": int(yp >= threshold), "threshold": float(threshold), "failure_type": ft, "source": src})
         out = resolve_output_path(args.save_preds)
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as f:

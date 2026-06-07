@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
-from PIL import Image, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -69,6 +69,23 @@ class RandomBlur:
         return img.filter(ImageFilter.GaussianBlur(radius=self.radius))
 
 
+class StrongCorruption:
+    def __init__(self, min_frac: float = 0.35, max_frac: float = 0.60, blur_radius: float = 2.5):
+        self.min_frac = min_frac
+        self.max_frac = max_frac
+        self.blur_radius = blur_radius
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img = img.copy().filter(ImageFilter.GaussianBlur(radius=self.blur_radius))
+        w, h = img.size
+        occ_w = int(w * random.uniform(self.min_frac, self.max_frac))
+        occ_h = int(h * random.uniform(self.min_frac, self.max_frac))
+        x0 = random.randint(0, max(0, w - occ_w))
+        y0 = random.randint(0, max(0, h - occ_h))
+        img.paste(Image.new("RGB", (occ_w, occ_h), (127, 127, 127)), (x0, y0))
+        return img
+
+
 def make_transforms(img_size: int, train: bool):
     aug = []
     if train:
@@ -85,11 +102,46 @@ def make_transforms(img_size: int, train: bool):
     ])
 
 
+def _sample_jitter(value: float) -> float:
+    return random.uniform(max(0.0, 1.0 - value), 1.0 + value)
+
+
+class PairTrainTransform:
+    def __init__(self, img_size: int):
+        self.img_size = img_size
+        self.to_tensor = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self.occlusion = RandomOcclusion(p=0.16)
+        self.blur = RandomBlur(p=0.08)
+
+    def _color_jitter(self, img: Image.Image, brightness: float, contrast: float, saturation: float) -> Image.Image:
+        img = ImageEnhance.Brightness(img).enhance(brightness)
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+        img = ImageEnhance.Color(img).enhance(saturation)
+        return img
+
+    def __call__(self, before: Image.Image, after: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
+        before = transforms.functional.resize(before, (self.img_size, self.img_size))
+        after = transforms.functional.resize(after, (self.img_size, self.img_size))
+        brightness = _sample_jitter(0.12)
+        contrast = _sample_jitter(0.12)
+        saturation = _sample_jitter(0.06)
+        before = self._color_jitter(before, brightness, contrast, saturation)
+        after = self._color_jitter(after, brightness, contrast, saturation)
+        before = self.blur(self.occlusion(before))
+        after = self.blur(self.occlusion(after))
+        return self.to_tensor(before), self.to_tensor(after)
+
+
 class PairInstructionDataset(Dataset):
-    def __init__(self, jsonl: str, vocab: Dict[str, int], img_size: int = 224, train: bool = False, max_text_len: int = 64):
+    def __init__(self, jsonl: str, vocab: Dict[str, int], img_size: int = 224, train: bool = False, max_text_len: int = 64, paired_aug: bool = True):
         self.rows = read_jsonl(jsonl)
         self.vocab = vocab
         self.tf = make_transforms(img_size, train=train)
+        self.pair_tf = PairTrainTransform(img_size) if train and paired_aug else None
+        self.strong_corruption = StrongCorruption()
         self.max_text_len = max_text_len
 
     def __len__(self):
@@ -99,10 +151,23 @@ class PairInstructionDataset(Dataset):
         img = Image.open(path).convert("RGB")
         return self.tf(img)
 
+    def _load_pil(self, path: str) -> Image.Image:
+        return Image.open(path).convert("RGB")
+
     def __getitem__(self, idx: int):
         r = self.rows[idx]
-        before = self._load_image(r["before"])
-        after = self._load_image(r["after"])
+        before_img = self._load_pil(r["before"])
+        after_img = self._load_pil(r["after"])
+        if r.get("counterfactual_type") == "visual_corruption" or r.get("failure_type") == "visual_corruption":
+            if r.get("corrupt_target", "after") == "before":
+                before_img = self.strong_corruption(before_img)
+            else:
+                after_img = self.strong_corruption(after_img)
+        if self.pair_tf is None:
+            before = self.tf(before_img)
+            after = self.tf(after_img)
+        else:
+            before, after = self.pair_tf(before_img, after_img)
         text_ids = encode_text(r.get("instruction", ""), self.vocab, max_len=self.max_text_len)
         label = torch.tensor(float(r["label"]), dtype=torch.float32)
         return {

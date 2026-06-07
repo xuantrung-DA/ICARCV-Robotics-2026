@@ -1,7 +1,7 @@
 from typing import Dict
 
 import numpy as np
-from sklearn.metrics import accuracy_score, average_precision_score, f1_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, f1_score, precision_recall_fscore_support, roc_auc_score
 
 
 def binary_metrics(y_true, y_prob, threshold: float = 0.5) -> Dict[str, float]:
@@ -11,6 +11,7 @@ def binary_metrics(y_true, y_prob, threshold: float = 0.5) -> Dict[str, float]:
 
     out = {
         "acc": float(accuracy_score(y_true, y_pred)),
+        "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
     }
     p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
@@ -22,6 +23,19 @@ def binary_metrics(y_true, y_prob, threshold: float = 0.5) -> Dict[str, float]:
         out["auroc"] = float("nan")
         out["auprc"] = float("nan")
     return out
+
+
+def find_best_threshold(y_true, y_prob, metric: str = "f1", lo: float = 0.05, hi: float = 0.95, steps: int = 181) -> Dict[str, float]:
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    thresholds = np.linspace(lo, hi, steps)
+    best = {"threshold": 0.5, metric: -1.0}
+    for threshold in thresholds:
+        row = binary_metrics(y_true, y_prob, threshold=float(threshold))
+        score = row[metric]
+        if score > best[metric]:
+            best = {"threshold": float(threshold), **row}
+    return best
 
 
 def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
@@ -39,11 +53,11 @@ def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
     return float(ece)
 
 
-def risk_coverage(y_true, y_prob, coverages=(1.0, 0.9, 0.8, 0.7, 0.6)) -> Dict[str, float]:
+def risk_coverage(y_true, y_prob, coverages=(1.0, 0.9, 0.8, 0.7, 0.6), threshold: float = 0.5) -> Dict[str, float]:
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
     conf = np.maximum(y_prob, 1 - y_prob)
-    pred = (y_prob >= 0.5).astype(int)
+    pred = (y_prob >= threshold).astype(int)
     order = np.argsort(-conf)
     out = {}
     n = len(y_true)
