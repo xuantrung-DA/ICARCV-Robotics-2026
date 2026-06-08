@@ -1,8 +1,10 @@
+"""CounterFail-Edge ONNX export."""
+
 import argparse
 import torch
 
 from .data import load_vocab
-from .model import CounterFailNet
+from .model import CODE_VERSION, CounterFailNet
 
 
 def main():
@@ -14,13 +16,24 @@ def main():
     parser.add_argument("--max_text_len", type=int, default=64)
     args = parser.parse_args()
 
+    print(f"[export_onnx.py] CODE_VERSION={CODE_VERSION}")
+
     vocab = load_vocab(args.vocab)
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     train_args = ckpt.get("args", {})
+
+    encoder = train_args.get("encoder", "mobilenet_v3_large")
+    text_encoder_type = train_args.get("text_encoder", "mean")
+    text_dim = train_args.get("text_dim", 256)
+    hidden_dim = train_args.get("hidden_dim", 256)
+
     model = CounterFailNet(
         vocab_size=len(vocab),
-        encoder=train_args.get("encoder", "mobilenet_v3_small"),
+        encoder=encoder,
         pretrained=False,
+        text_encoder_type=text_encoder_type,
+        text_dim=text_dim,
+        hidden_dim=hidden_dim,
     )
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -45,7 +58,7 @@ def main():
         },
         opset_version=17,
     )
-    print(f"Exported ONNX to {args.out}")
+    print(f"Exported ONNX to {args.out} (encoder={encoder}, text_encoder={text_encoder_type})")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
+"""CounterFail-Edge dataset and transforms."""
+
 import json
 import random
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -37,6 +40,25 @@ def encode_text(text: str, vocab: Dict[str, int], max_len: int = 64) -> torch.Te
     return torch.tensor(ids, dtype=torch.long)
 
 
+def compute_oov_rate(rows: List[dict], vocab: Dict[str, int]) -> dict:
+    """Report total tokens, unk tokens, unk rate, top unknown tokens."""
+    total, unk = 0, 0
+    unk_tokens: Counter = Counter()
+    unk_id = vocab.get("<unk>", 1)
+    for r in rows:
+        for tok in tokenize(r.get("instruction", "")):
+            total += 1
+            if vocab.get(tok, unk_id) == unk_id:
+                unk += 1
+                unk_tokens[tok] += 1
+    return {
+        "total_tokens": total,
+        "unk_tokens": unk,
+        "unk_rate": unk / max(total, 1),
+        "top_unk": unk_tokens.most_common(20),
+    }
+
+
 class RandomOcclusion:
     def __init__(self, p: float = 0.25, min_frac: float = 0.08, max_frac: float = 0.25):
         self.p = p
@@ -52,7 +74,6 @@ class RandomOcclusion:
         occ_h = int(h * random.uniform(self.min_frac, self.max_frac))
         x0 = random.randint(0, max(0, w - occ_w))
         y0 = random.randint(0, max(0, h - occ_h))
-        # Fill with mean-ish gray without requiring numpy.
         patch = Image.new("RGB", (occ_w, occ_h), (127, 127, 127))
         img.paste(patch, (x0, y0))
         return img
@@ -70,6 +91,8 @@ class RandomBlur:
 
 
 class StrongCorruption:
+    """Strong visual corruption — only applied when counterfactual_type=='visual_corruption'."""
+
     def __init__(self, min_frac: float = 0.35, max_frac: float = 0.60, blur_radius: float = 2.5):
         self.min_frac = min_frac
         self.max_frac = max_frac
@@ -136,7 +159,8 @@ class PairTrainTransform:
 
 
 class PairInstructionDataset(Dataset):
-    def __init__(self, jsonl: str, vocab: Dict[str, int], img_size: int = 224, train: bool = False, max_text_len: int = 64, paired_aug: bool = True):
+    def __init__(self, jsonl: str, vocab: Dict[str, int], img_size: int = 224,
+                 train: bool = False, max_text_len: int = 64, paired_aug: bool = True):
         self.rows = read_jsonl(jsonl)
         self.vocab = vocab
         self.tf = make_transforms(img_size, train=train)
@@ -158,11 +182,14 @@ class PairInstructionDataset(Dataset):
         r = self.rows[idx]
         before_img = self._load_pil(r["before"])
         after_img = self._load_pil(r["after"])
-        if r.get("counterfactual_type") == "visual_corruption" or r.get("failure_type") == "visual_corruption":
+
+        # Only apply StrongCorruption if explicitly marked as visual_corruption
+        if r.get("counterfactual_type") == "visual_corruption":
             if r.get("corrupt_target", "after") == "before":
                 before_img = self.strong_corruption(before_img)
             else:
                 after_img = self.strong_corruption(after_img)
+
         if self.pair_tf is None:
             before = self.tf(before_img)
             after = self.tf(after_img)
@@ -177,6 +204,12 @@ class PairInstructionDataset(Dataset):
             "label": label,
             "failure_type": r.get("failure_type", ""),
             "source": r.get("source", ""),
+            "taskvar": r.get("taskvar", ""),
+            "synthetic": r.get("synthetic", False),
+            "counterfactual_type": r.get("counterfactual_type", ""),
+            "instruction": r.get("instruction", ""),
+            "before_path": r.get("before", ""),
+            "after_path": r.get("after", ""),
         }
 
 
@@ -194,4 +227,10 @@ def collate_fn(batch: List[dict]) -> dict:
         "label": labels,
         "failure_type": [b["failure_type"] for b in batch],
         "source": [b["source"] for b in batch],
+        "taskvar": [b["taskvar"] for b in batch],
+        "synthetic": [b["synthetic"] for b in batch],
+        "counterfactual_type": [b["counterfactual_type"] for b in batch],
+        "instruction": [b["instruction"] for b in batch],
+        "before_path": [b["before_path"] for b in batch],
+        "after_path": [b["after_path"] for b in batch],
     }

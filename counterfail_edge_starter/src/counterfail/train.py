@@ -1,5 +1,8 @@
+"""CounterFail-Edge training script."""
+
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +13,14 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from .data import PairInstructionDataset, collate_fn, load_vocab
-from .metrics import binary_metrics, expected_calibration_error, find_best_threshold
-from .model import CounterFailNet, contrastive_loss
+from .metrics import (
+    binary_metrics,
+    expected_calibration_error,
+    find_best_threshold,
+    per_type_mean_recall as compute_per_type_mean_recall,
+    per_type_recall,
+)
+from .model import CODE_VERSION, CounterFailNet, contrastive_loss
 from .paths import resolve_input_path, resolve_output_path
 
 
@@ -50,9 +59,13 @@ def bce_focal_loss(logits: torch.Tensor, labels: torch.Tensor, pos_weight: torch
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, threshold: float = 0.5, tune_threshold: bool = False, threshold_metric: str = "f1"):
+def evaluate(model, loader, device, threshold: float = 0.5,
+             tune_threshold: bool = False, threshold_metric: str = "macro_f1",
+             threshold_min: float = 0.05, threshold_max: float = 0.95):
+    """Evaluate model, collecting failure_types for per-type metrics."""
     model.eval()
     y_true, y_prob = [], []
+    failure_types_list = []
     for batch in loader:
         before = batch["before"].to(device)
         after = batch["after"].to(device)
@@ -63,12 +76,26 @@ def evaluate(model, loader, device, threshold: float = 0.5, tune_threshold: bool
         probs = torch.sigmoid(logits).detach().cpu().numpy().tolist()
         y_true.extend(labels)
         y_prob.extend(probs)
+        failure_types_list.extend(batch["failure_type"])
+
     if tune_threshold:
-        metrics = find_best_threshold(y_true, y_prob, metric=threshold_metric)
+        metrics = find_best_threshold(
+            y_true, y_prob,
+            metric=threshold_metric,
+            lo=threshold_min,
+            hi=threshold_max,
+            failure_types=failure_types_list,
+        )
     else:
         metrics = binary_metrics(y_true, y_prob, threshold=threshold)
         metrics["threshold"] = float(threshold)
-    metrics["ece"] = expected_calibration_error(y_true, y_prob)
+
+    # Always compute per-type metrics
+    pt = per_type_recall(y_true, y_prob, failure_types_list, metrics.get("threshold", threshold))
+    ptmr = compute_per_type_mean_recall(y_true, y_prob, failure_types_list, metrics.get("threshold", threshold))
+    metrics["per_type_recall"] = pt
+    metrics["per_type_mean_recall"] = ptmr
+    metrics["ece_prob"] = expected_calibration_error(y_true, y_prob)
     return metrics
 
 
@@ -78,7 +105,10 @@ def main():
     parser.add_argument("--val_jsonl", required=True)
     parser.add_argument("--vocab", required=True)
     parser.add_argument("--out_dir", default="runs/counterfail")
-    parser.add_argument("--encoder", default="mobilenet_v3_small", choices=["mobilenet_v3_small", "resnet18"])
+    parser.add_argument("--encoder", default="mobilenet_v3_large",
+                        choices=["mobilenet_v3_small", "mobilenet_v3_large",
+                                 "efficientnet_b0", "resnet18", "shufflenet_v2_x1_0"])
+    parser.add_argument("--text_encoder", choices=["mean", "bigru"], default="bigru")
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--freeze_image", action="store_true")
     parser.add_argument("--img_size", type=int, default=224)
@@ -88,18 +118,35 @@ def main():
     parser.add_argument("--backbone_lr_mult", type=float, default=0.25)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--contrastive_weight", type=float, default=0.05)
-    parser.add_argument("--pos_weight", type=str, default="auto", help="Use 'auto', 'none', or a positive float for BCE positive-class weight.")
-    parser.add_argument("--balanced_sampler", action="store_true", help="Sample success/failure classes with equal probability during training.")
+    parser.add_argument("--contrastive_weight", type=float, default=0.03)
+    parser.add_argument("--pos_weight", type=str, default="none",
+                        help="Use 'auto', 'none', or a positive float for BCE positive-class weight.")
+    parser.add_argument("--balanced_sampler", action="store_true",
+                        help="Sample success/failure classes with equal probability during training.")
     parser.add_argument("--loss", choices=["bce", "focal"], default="bce")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
-    parser.add_argument("--no_paired_aug", action="store_true", help="Use independent before/after augmentations instead of pair-consistent training augmentations.")
-    parser.add_argument("--select_metric", choices=["f1", "balanced_acc", "auroc", "auprc"], default="f1")
-    parser.add_argument("--fixed_threshold", type=float, default=None, help="If set, validate with this threshold instead of tuning on validation each epoch.")
+    parser.add_argument("--no_paired_aug", action="store_true",
+                        help="Use independent before/after augmentations instead of pair-consistent training augmentations.")
+    parser.add_argument(
+        "--select_metric",
+        choices=["macro_f1", "balanced_acc", "failure_f1", "failure_recall",
+                 "success_f1", "per_type_mean_recall", "auroc_failure", "auprc_failure"],
+        default="per_type_mean_recall",
+    )
+    parser.add_argument("--threshold_min", type=float, default=0.05)
+    parser.add_argument("--threshold_max", type=float, default=0.95)
+    parser.add_argument("--early_stop_patience", type=int, default=3,
+                        help="Stop training if no improvement for this many epochs.")
+    parser.add_argument("--fixed_threshold", type=float, default=None,
+                        help="If set, validate with this threshold instead of tuning on validation each epoch.")
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
+
+    # ---- Startup info ----
+    print(f"[train.py] __file__={__file__}")
+    print(f"[train.py] CODE_VERSION={CODE_VERSION}")
 
     set_seed(args.seed)
     train_jsonl = resolve_input_path(args.train_jsonl)
@@ -124,6 +171,7 @@ def main():
         vocab_size=len(vocab),
         encoder=args.encoder,
         pretrained=args.pretrained,
+        text_encoder_type=args.text_encoder,
         freeze_image=args.freeze_image,
     ).to(device)
 
@@ -140,7 +188,12 @@ def main():
     pos_weight_value = parse_pos_weight(args.pos_weight, train_ds.rows)
     pos_weight = None if pos_weight_value is None else torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
 
+    # ---- Print train stats ----
     labels_np = np.asarray([float(r["label"]) for r in train_ds.rows])
+    ft_counter = Counter(r.get("failure_type", "") for r in train_ds.rows)
+    ct_counter = Counter(r.get("counterfactual_type", "") for r in train_ds.rows)
+    syn_counter = Counter(r.get("synthetic", False) for r in train_ds.rows)
+
     print(json.dumps({
         "train_samples": int(len(labels_np)),
         "train_success": int((labels_np > 0.5).sum()),
@@ -148,9 +201,19 @@ def main():
         "pos_weight": None if pos_weight_value is None else float(pos_weight_value),
         "balanced_sampler": bool(args.balanced_sampler),
         "paired_aug": bool(not args.no_paired_aug),
+        "encoder": args.encoder,
+        "text_encoder": args.text_encoder,
+        "select_metric": args.select_metric,
+        "contrastive_weight": args.contrastive_weight,
+        "code_version": CODE_VERSION,
     }, indent=2))
+    print(f"\nFailure type counts: {dict(ft_counter.most_common())}")
+    print(f"Counterfactual type counts: {dict(ct_counter.most_common())}")
+    print(f"Synthetic counts: {dict(syn_counter)}")
 
     best_score = -1.0
+    best_epoch = 0
+    patience_counter = 0
     history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -173,7 +236,10 @@ def main():
                     bce = bce_focal_loss(logits, labels, pos_weight=pos_weight, gamma=args.focal_gamma)
                 else:
                     bce = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
-                con = contrastive_loss(pair_z, text_z, labels)
+                if args.contrastive_weight > 0:
+                    con = contrastive_loss(pair_z, text_z, labels)
+                else:
+                    con = torch.tensor(0.0, device=device)
                 loss = bce + args.contrastive_weight * con
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -195,21 +261,31 @@ def main():
             threshold=0.5 if args.fixed_threshold is None else args.fixed_threshold,
             tune_threshold=args.fixed_threshold is None,
             threshold_metric=args.select_metric,
+            threshold_min=args.threshold_min,
+            threshold_max=args.threshold_max,
         )
         lrs = scheduler.get_last_lr()
         row = {
             "epoch": epoch,
             "train_loss": total_loss / max(1, n_steps),
+            "train_bce": total_bce / max(1, n_steps),
+            "train_con": total_con / max(1, n_steps),
             "lr_backbone": lrs[0] if len(lrs) > 1 else None,
             "lr_head": lrs[-1],
-            **val_metrics,
         }
+        # Add scalar val metrics (skip nested dicts for history readability)
+        for k, v in val_metrics.items():
+            if isinstance(v, (int, float)):
+                row[k] = v
         history.append(row)
         print("VAL", json.dumps(row, indent=2))
 
-        score = val_metrics[args.select_metric]
+        # ---- Metric selection ----
+        score = val_metrics.get(args.select_metric, val_metrics.get("macro_f1", 0.0))
         if score > best_score:
             best_score = score
+            best_epoch = epoch
+            patience_counter = 0
             ckpt = {
                 "model": model.state_dict(),
                 "args": vars(args),
@@ -217,13 +293,38 @@ def main():
                 "best_score": best_score,
                 "best_metric": args.select_metric,
                 "best_threshold": val_metrics.get("threshold", 0.5),
-                "best_val_metrics": val_metrics,
+                "best_val_metrics": {k: v for k, v in val_metrics.items() if isinstance(v, (int, float, str))},
+                "code_version": CODE_VERSION,
             }
             torch.save(ckpt, out_dir / "best.pt")
-            print(f"Saved best checkpoint to {out_dir / 'best.pt'}")
+            print(f"Saved best checkpoint to {out_dir / 'best.pt'} (epoch {epoch}, {args.select_metric}={score:.4f})")
+
+            # Save best val metrics
+            with (out_dir / "best_val_metrics.json").open("w", encoding="utf-8") as f:
+                json.dump(val_metrics, f, indent=2, default=str)
+        else:
+            patience_counter += 1
+
+        # Always save last checkpoint
+        last_ckpt = {
+            "model": model.state_dict(),
+            "args": vars(args),
+            "vocab_size": len(vocab),
+            "last_score": score,
+            "last_threshold": val_metrics.get("threshold", 0.5),
+            "code_version": CODE_VERSION,
+        }
+        torch.save(last_ckpt, out_dir / "last.pt")
+
+        # Early stopping
+        if patience_counter >= args.early_stop_patience:
+            print(f"Early stopping at epoch {epoch} (no improvement for {args.early_stop_patience} epochs). "
+                  f"Best epoch={best_epoch}, best {args.select_metric}={best_score:.4f}")
+            break
 
     with (out_dir / "history.json").open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    print(f"\nTraining complete. Best {args.select_metric}={best_score:.4f} at epoch {best_epoch}.")
 
 
 if __name__ == "__main__":
