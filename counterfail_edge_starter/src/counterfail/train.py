@@ -17,6 +17,8 @@ from .metrics import (
     binary_metrics,
     expected_calibration_error,
     find_best_threshold,
+    group_balanced_type_recall as compute_group_balanced_type_recall,
+    group_hmean_recall as compute_group_hmean_recall,
     per_type_mean_recall as compute_per_type_mean_recall,
     per_type_recall,
 )
@@ -91,11 +93,16 @@ def evaluate(model, loader, device, threshold: float = 0.5,
         metrics["threshold"] = float(threshold)
 
     # Always compute per-type metrics
-    pt = per_type_recall(y_true, y_prob, failure_types_list, metrics.get("threshold", threshold))
-    ptmr = compute_per_type_mean_recall(y_true, y_prob, failure_types_list, metrics.get("threshold", threshold))
+    thr = metrics.get("threshold", threshold)
+    pt = per_type_recall(y_true, y_prob, failure_types_list, thr)
+    ptmr = compute_per_type_mean_recall(y_true, y_prob, failure_types_list, thr)
+    ghr = compute_group_hmean_recall(y_true, y_prob, failure_types_list, thr)
+    gbtr = compute_group_balanced_type_recall(y_true, y_prob, failure_types_list, thr)
     metrics["per_type_recall"] = pt
     metrics["per_type_mean_recall"] = ptmr
-    metrics["ece_prob"] = expected_calibration_error(y_true, y_prob)
+    metrics["group_hmean_recall"] = ghr
+    metrics["group_balanced_type_recall"] = gbtr
+    metrics["ece_prob"] = expected_calibration_error(y_true, y_prob, threshold=thr)
     return metrics
 
 
@@ -130,8 +137,9 @@ def main():
     parser.add_argument(
         "--select_metric",
         choices=["macro_f1", "balanced_acc", "failure_f1", "failure_recall",
-                 "success_f1", "per_type_mean_recall", "auroc_failure", "auprc_failure"],
-        default="per_type_mean_recall",
+                 "success_f1", "per_type_mean_recall", "group_hmean_recall",
+                 "group_balanced_type_recall", "auroc_failure", "auprc_failure"],
+        default="group_hmean_recall",
     )
     parser.add_argument("--threshold_min", type=float, default=0.05)
     parser.add_argument("--threshold_max", type=float, default=0.95)
@@ -277,6 +285,10 @@ def main():
         for k, v in val_metrics.items():
             if isinstance(v, (int, float)):
                 row[k] = v
+        # Flatten per-type recall into history for tracking
+        if "per_type_recall" in val_metrics:
+            for ft, info in val_metrics["per_type_recall"].items():
+                row[f"recall_{ft.replace(' ', '_')}"] = info["recall"]
         history.append(row)
         print("VAL", json.dumps(row, indent=2))
 

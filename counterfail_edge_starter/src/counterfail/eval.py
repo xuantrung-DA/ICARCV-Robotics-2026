@@ -14,6 +14,8 @@ from .metrics import (
     binary_metrics,
     expected_calibration_error,
     find_best_threshold,
+    group_balanced_type_recall,
+    group_hmean_recall,
     per_type_mean_recall,
     per_type_recall,
     risk_coverage,
@@ -76,7 +78,8 @@ def main():
     parser.add_argument(
         "--threshold_metric",
         choices=["macro_f1", "balanced_acc", "failure_f1", "failure_recall",
-                 "success_f1", "per_type_mean_recall"],
+                 "success_f1", "per_type_mean_recall", "group_hmean_recall",
+                 "group_balanced_type_recall"],
         default="macro_f1",
     )
     parser.add_argument("--threshold_min", type=float, default=0.05)
@@ -152,11 +155,15 @@ def main():
     # ---- Per-type recall ----
     pt = per_type_recall(y_true, y_prob, failure_types, threshold)
     ptmr = per_type_mean_recall(y_true, y_prob, failure_types, threshold)
+    ghr = group_hmean_recall(y_true, y_prob, failure_types, threshold)
+    gbtr = group_balanced_type_recall(y_true, y_prob, failure_types, threshold)
     metrics["per_type_recall"] = pt
     metrics["per_type_mean_recall"] = ptmr
+    metrics["group_hmean_recall"] = ghr
+    metrics["group_balanced_type_recall"] = gbtr
 
     # ---- Calibration & risk ----
-    metrics["ece_prob"] = expected_calibration_error(y_true, y_prob)
+    metrics["ece_prob"] = expected_calibration_error(y_true, y_prob, threshold=threshold)
     metrics.update(risk_coverage(y_true, y_prob, threshold=threshold,
                                  confidence_mode=args.confidence_mode))
 
@@ -199,6 +206,7 @@ def main():
                 "before": r.get("before", ""),
                 "after": r.get("after", ""),
                 "taskvar": r.get("taskvar", ""),
+                "episode_id": r.get("episode_id", ""),
                 "counterfactual_type": r.get("counterfactual_type", ""),
                 "synthetic": r.get("synthetic", False),
             })

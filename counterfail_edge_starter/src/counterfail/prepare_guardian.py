@@ -31,6 +31,13 @@ ACTION_WORDS = frozenset({
     "pick", "place", "put", "move", "grasp", "release", "reach", "drag",
 })
 
+LOCATION_WORDS = frozenset({
+    "left", "right", "top", "bottom", "front", "back", "center", "middle",
+    "above", "below", "near", "far", "inside", "outside", "corner",
+    "edge", "side", "drawer", "shelf", "table", "bin", "box", "tray",
+    "plate", "bowl", "cup", "container", "slot", "rack", "hook",
+})
+
 
 def read_jsonl(path: Path) -> Iterable[dict]:
     with path.open("r", encoding="utf-8") as f:
@@ -199,18 +206,34 @@ def extract_object_target_tokens(row: dict) -> set:
     return set(t for t in tokens if t not in STOPWORDS and t not in ACTION_WORDS)
 
 
+def extract_object_only_tokens(row: dict) -> set:
+    """Extract tokens likely referring to objects (not locations/states)."""
+    tokens = tokenize_instruction(row.get("instruction", ""))
+    return set(t for t in tokens if t not in STOPWORDS and t not in ACTION_WORDS and t not in LOCATION_WORDS)
+
+
+def extract_location_state_tokens(row: dict) -> set:
+    """Extract tokens likely referring to locations or states."""
+    tokens = tokenize_instruction(row.get("instruction", ""))
+    return set(t for t in tokens if t in LOCATION_WORDS)
+
+
 # ---------------------------------------------------------------------------
 # Hard candidate scoring
 # ---------------------------------------------------------------------------
 def hard_candidates(row: dict, success_rows: List[dict], mode: str = "semantic_hard",
                     top_k: int = 50, same_source: bool = True) -> List[dict]:
-    """Score and rank candidates for hard negative generation."""
+    """Score and rank candidates for hard negative generation.
+
+    Scoring uses overlap ratios for finer-grained ranking.
+    """
     row_src = row.get("source", "")
     row_taskvar = row.get("taskvar", "")
     row_episode = row.get("episode_id")
     row_action = extract_action_tokens(row)
     row_content = extract_content_tokens(row)
-    row_objects = extract_object_target_tokens(row)
+    row_objects = extract_object_only_tokens(row)
+    row_locations = extract_location_state_tokens(row)
     row_instr = row.get("instruction", "")
     row_before = row.get("before", "")
     row_after = row.get("after", "")
@@ -221,20 +244,34 @@ def hard_candidates(row: dict, success_rows: List[dict], mode: str = "semantic_h
             continue
         if c.get("before") == row_before and c.get("after") == row_after and c.get("instruction") == row_instr:
             continue
-        s = 0
+        s = 0.0
         if same_source and c.get("source", "") == row_src:
-            s += 3
+            s += 3.0
         c_action = extract_action_tokens(c)
         c_content = extract_content_tokens(c)
-        if row_action & c_action:
-            s += 2
-        if row_content & c_content:
-            s += 2
+        c_objects = extract_object_only_tokens(c)
+        c_locations = extract_location_state_tokens(c)
+
+        # Action overlap ratio
+        action_union = row_action | c_action
+        if action_union:
+            action_overlap = len(row_action & c_action) / len(action_union)
+            s += action_overlap * 3.0  # 0-3 continuous
+
+        # Content overlap ratio
+        content_union = row_content | c_content
+        if content_union:
+            content_overlap = len(row_content & c_content) / len(content_union)
+            s += content_overlap * 2.0  # 0-2 continuous
+
         c_taskvar = c.get("taskvar", "")
-        if row_taskvar and c_taskvar and row_taskvar.split("+")[0] == c_taskvar.split("+")[0]:
-            s += 1
+        if row_taskvar and c_taskvar:
+            if row_taskvar.split("+")[0] == c_taskvar.split("+")[0]:
+                s += 2.0  # Same task family
+            if row_taskvar == c_taskvar:
+                s -= 1.0  # Same exact taskvar less useful
         if c.get("instruction", "") == row_instr:
-            s -= 2
+            s -= 3.0  # Identical instruction not useful
         scored.append((s, c))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -243,27 +280,62 @@ def hard_candidates(row: dict, success_rows: List[dict], mode: str = "semantic_h
 
 
 def _pick_wrong_object_candidate(row: dict, candidates: List[dict], rng: random.Random) -> Optional[dict]:
-    """Pick candidate with action overlap but different object/target tokens."""
+    """Pick candidate with action overlap HIGH but object overlap LOW.
+
+    This simulates 'robot did the right action on the wrong object'.
+    """
     row_action = extract_action_tokens(row)
-    row_objects = extract_object_target_tokens(row)
+    row_objects = extract_object_only_tokens(row)
     good = []
+    acceptable = []
     for c in candidates:
         c_action = extract_action_tokens(c)
-        c_objects = extract_object_target_tokens(c)
-        if row_action & c_action and not (row_objects == c_objects):
-            good.append(c)
-    return rng.choice(good) if good else (rng.choice(candidates) if candidates else None)
+        c_objects = extract_object_only_tokens(c)
+        # Action overlap ratio
+        action_union = row_action | c_action
+        action_overlap = len(row_action & c_action) / max(len(action_union), 1)
+        # Object overlap ratio
+        object_union = row_objects | c_objects
+        object_overlap = len(row_objects & c_objects) / max(len(object_union), 1)
+
+        if action_overlap >= 0.5 and object_overlap <= 0.3 and c_objects:
+            good.append(c)  # Best: same action, different object
+        elif action_overlap > 0 and object_overlap < 0.8 and row_objects != c_objects:
+            acceptable.append(c)  # Fallback: some action overlap, not identical objects
+
+    if good:
+        return rng.choice(good)
+    if acceptable:
+        return rng.choice(acceptable)
+    return rng.choice(candidates) if candidates else None
 
 
 def _pick_wrong_placement_candidate(row: dict, candidates: List[dict], rng: random.Random) -> Optional[dict]:
-    """Pick candidate with overlapping object tokens but different target/location."""
-    row_objects = extract_object_target_tokens(row)
+    """Pick candidate with overlapping object tokens but different location/state.
+
+    This simulates 'robot manipulated the right object but to the wrong place/state'.
+    """
+    row_objects = extract_object_only_tokens(row)
+    row_locations = extract_location_state_tokens(row)
     good = []
+    acceptable = []
     for c in candidates:
-        c_objects = extract_object_target_tokens(c)
-        if row_objects & c_objects and row_objects != c_objects:
-            good.append(c)
-    return rng.choice(good) if good else (rng.choice(candidates) if candidates else None)
+        c_objects = extract_object_only_tokens(c)
+        c_locations = extract_location_state_tokens(c)
+        # Object overlap ratio
+        object_union = row_objects | c_objects
+        object_overlap = len(row_objects & c_objects) / max(len(object_union), 1)
+
+        if object_overlap >= 0.5 and row_locations != c_locations:
+            good.append(c)  # Best: same objects, different location/state
+        elif object_overlap > 0.3 and row_objects != c_objects:
+            acceptable.append(c)  # Fallback: high object overlap, some difference
+
+    if good:
+        return rng.choice(good)
+    if acceptable:
+        return rng.choice(acceptable)
+    return rng.choice(candidates) if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +518,7 @@ def main():
     parser.add_argument("--counterfactual_types", type=str, default=DEFAULT_CF_TYPES,
                         help="Comma-separated counterfactual types.")
     parser.add_argument("--neg_per_pos", type=int, default=3)
-    parser.add_argument("--max_no_progress_frac", type=float, default=0.20)
+    parser.add_argument("--max_no_progress_frac", type=float, default=0.15)
     parser.add_argument("--hard_top_k", type=int, default=50)
     parser.add_argument("--same_source_hard_negatives", action="store_true", default=True)
     parser.add_argument("--allow_visual_corruption_negative", action="store_true", default=False)
@@ -530,7 +602,7 @@ def main():
             if rows:
                 write_jsonl(out_root / f"{split}_{source}.jsonl", rows)
 
-    vocab = build_vocab(train_rows, min_freq=args.min_word_freq)
+    vocab = build_vocab(all_rows, min_freq=args.min_word_freq)
     with (out_root / "vocab.json").open("w", encoding="utf-8") as f:
         json.dump(vocab, f, ensure_ascii=False, indent=2)
 

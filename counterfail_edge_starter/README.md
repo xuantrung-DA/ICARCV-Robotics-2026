@@ -33,9 +33,10 @@
        ▼                 ▼                   ▼
   ┌────────────────────────┐        ┌───────────────┐
   │ Shared Image Encoder   │        │ Text Encoder  │
-  │ (MobileNetV3 / ResNet) │        │ (Embedding +  │
-  └───────────┬────────────┘        │  MeanPool)    │
-              │                     └───────┬───────┘
+  │ (MobileNetV3-Large/    │        │ (BiGRU /      │
+  │  Small / EfficientNet) │        │  MeanPool)    │
+  └───────────┬────────────┘        └───────┬───────┘
+              │                             │
               ▼                             │
   ┌───────────────────────┐                 │
   │ Visual Difference     │                 │
@@ -166,17 +167,19 @@ python -m src.counterfail.train \
   --train_jsonl data/processed/train.jsonl \
   --val_jsonl data/processed/val_bdv2fail.jsonl \
   --vocab data/processed/vocab.json \
-  --out_dir runs/counterfail_mbv3 \
-  --epochs 20 \
-  --batch_size 32 \
+  --out_dir runs/counterfail_mbv3large \
+  --epochs 12 \
+  --batch_size 24 \
   --img_size 224 \
-  --encoder mobilenet_v3_small \
+  --encoder mobilenet_v3_large \
+  --text_encoder bigru \
   --pretrained \
   --lr 3e-4 \
   --backbone_lr_mult 0.25 \
-  --contrastive_weight 0.05 \
-  --pos_weight auto \
-  --select_metric f1 \
+  --contrastive_weight 0.03 \
+  --balanced_sampler \
+  --pos_weight none \
+  --select_metric group_hmean_recall \
   --seed 42 \
   --amp
 ```
@@ -188,13 +191,18 @@ python -m src.counterfail.train `
   --train_jsonl data/processed/train.jsonl `
   --val_jsonl data/processed/val_bdv2fail.jsonl `
   --vocab data/processed/vocab.json `
-  --out_dir runs/counterfail_mbv3 `
+  --out_dir runs/counterfail_mbv3large `
   --epochs 12 `
-  --batch_size 32 `
+  --batch_size 24 `
   --img_size 224 `
-  --encoder mobilenet_v3_small `
+  --encoder mobilenet_v3_large `
+  --text_encoder bigru `
   --pretrained `
-  --contrastive_weight 0.05
+  --contrastive_weight 0.03 `
+  --balanced_sampler `
+  --pos_weight none `
+  --select_metric group_hmean_recall `
+  --amp
 ```
 
 **Tips:**
@@ -227,7 +235,7 @@ python -m src.counterfail.eval \
   --vocab data/processed/vocab.json
 ```
 
-**Evaluation metrics**: Accuracy, F1, Precision, Recall, AUROC, AUPRC, ECE (Expected Calibration Error), Risk@Coverage.
+**Evaluation metrics**: success_f1, failure_f1, macro_f1, success_recall, failure_recall, balanced_acc, group_hmean_recall, AUROC, AUPRC, ECE (Expected Calibration Error), Risk@Coverage, per-type recall.
 
 ### Step 5 – Export ONNX for Edge Deployment
 
@@ -298,14 +306,16 @@ Each sample in `metadata_execution.jsonl` contains:
 
 ## Counterfactual Augmentation
 
-When using `--success_only_counterfactual`, the pipeline generates 4 types of synthetic negatives from each success sample:
+When using `--success_only_counterfactual`, the pipeline generates 6 types of semantic-hard synthetic negatives from each success sample:
 
 | Type | Strategy | Rationale |
 |------|----------|-----------|
 | `no_progress` | Replace *after* with *before* image | Robot did nothing |
 | `temporal_reverse` | Swap *before* ↔ *after* | Undo instead of do |
-| `instruction_mismatch` | Replace instruction with a different task's | Wrong task description |
-| `after_mismatch` | Replace *after* with another task's *after* | Wrong outcome |
+| `instruction_mismatch_hard` | Replace instruction with a hard-negative task's | Wrong task (high token overlap) |
+| `endpoint_mismatch_hard` | Replace *after* with a hard-negative task's *after* | Wrong outcome (semantically similar) |
+| `wrong_object_like` | Replace instruction with same-action/different-object task | Simulates wrong object manipulation |
+| `wrong_state_or_placement_like` | Replace *after* with same-object/different-location task's *after* | Simulates wrong placement/state |
 
 This creates a balanced training set where the model must verify **all three modalities** (before, after, instruction) agree — not just check individual signals.
 

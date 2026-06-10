@@ -115,6 +115,49 @@ def per_type_mean_recall(y_true, y_prob, failure_types, threshold: float = 0.5) 
     return float(np.mean(recalls))
 
 
+def group_hmean_recall(y_true, y_prob, failure_types, threshold: float = 0.5) -> float:
+    """Harmonic mean of success_group_recall and failure_type_mean_recall.
+
+    This metric prevents checkpoint collapse: an all-failure predictor gets ~0.0
+    because success_recall ≈ 0, and an all-success predictor also gets ~0.0
+    because failure_type_mean_recall ≈ 0.
+    """
+    pt = per_type_recall(y_true, y_prob, failure_types, threshold)
+    if not pt:
+        return 0.0
+    success_recall = pt.get("success", {}).get("recall", 0.0)
+    failure_recalls = [v["recall"] for k, v in pt.items() if k != "success"]
+    if not failure_recalls:
+        return 0.0
+    failure_mean_recall = float(np.mean(failure_recalls))
+    denom = success_recall + failure_mean_recall
+    if denom == 0:
+        return 0.0
+    return float(2.0 * success_recall * failure_mean_recall / denom)
+
+
+def group_balanced_type_recall(y_true, y_prob, failure_types, threshold: float = 0.5) -> float:
+    """0.5 * success_recall + 0.5 * mean(failure_type_recalls).
+
+    Arithmetic-mean variant of group_hmean_recall. Less strict than harmonic mean
+    but still prevents collapse.
+    """
+    pt = per_type_recall(y_true, y_prob, failure_types, threshold)
+    if not pt:
+        return 0.0
+    success_recall = pt.get("success", {}).get("recall", 0.0)
+    failure_recalls = [v["recall"] for k, v in pt.items() if k != "success"]
+    if not failure_recalls:
+        return success_recall * 0.5
+    return float(0.5 * success_recall + 0.5 * np.mean(failure_recalls))
+
+
+# Metrics that require failure_types for threshold sweep
+_TYPE_AWARE_METRICS = frozenset({
+    "per_type_mean_recall", "group_hmean_recall", "group_balanced_type_recall",
+})
+
+
 def find_best_threshold(
     y_true,
     y_prob,
@@ -128,19 +171,26 @@ def find_best_threshold(
 
     Supported metrics:
       macro_f1, balanced_acc, failure_f1, failure_recall, success_f1,
-      per_type_mean_recall (requires failure_types).
+      per_type_mean_recall, group_hmean_recall, group_balanced_type_recall
+      (the last three require failure_types).
     """
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob, dtype=float)
     thresholds = np.linspace(lo, hi, steps)
 
+    _type_metric_fns = {
+        "per_type_mean_recall": per_type_mean_recall,
+        "group_hmean_recall": group_hmean_recall,
+        "group_balanced_type_recall": group_balanced_type_recall,
+    }
+
     best: Optional[tuple] = None
     for threshold in thresholds:
         th = float(threshold)
-        if metric == "per_type_mean_recall":
+        if metric in _TYPE_AWARE_METRICS:
             if failure_types is None:
-                raise ValueError("failure_types required for per_type_mean_recall metric")
-            score = per_type_mean_recall(y_true, y_prob, failure_types, th)
+                raise ValueError(f"failure_types required for {metric} metric")
+            score = _type_metric_fns[metric](y_true, y_prob, failure_types, th)
         else:
             row = binary_metrics(y_true, y_prob, threshold=th)
             score = row.get(metric)
@@ -154,17 +204,31 @@ def find_best_threshold(
     metrics = binary_metrics(y_true, y_prob, threshold=best_th)
     if failure_types is not None:
         metrics["per_type_mean_recall"] = per_type_mean_recall(y_true, y_prob, failure_types, best_th)
+        metrics["group_hmean_recall"] = group_hmean_recall(y_true, y_prob, failure_types, best_th)
+        metrics["group_balanced_type_recall"] = group_balanced_type_recall(y_true, y_prob, failure_types, best_th)
     return metrics
 
 
-def expected_calibration_error(y_true, y_prob, n_bins: int = 15) -> float:
-    """Probability calibration ECE around p=0.5."""
+def expected_calibration_error(y_true, y_prob, threshold: float = 0.5, n_bins: int = 15) -> float:
+    """Expected Calibration Error.
+
+    When threshold=0.5 this is standard probability ECE.
+    When threshold != 0.5, confidence is computed as margin from the decision
+    boundary: conf = abs(p - threshold), giving a 'decision ECE'.
+    """
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
-    conf = np.maximum(y_prob, 1 - y_prob)
-    pred = (y_prob >= 0.5).astype(int)
+    if abs(threshold - 0.5) < 1e-6:
+        # Standard probability ECE
+        conf = np.maximum(y_prob, 1 - y_prob)
+        pred = (y_prob >= 0.5).astype(int)
+        bins = np.linspace(0.5, 1.0, n_bins + 1)
+    else:
+        # Decision ECE: confidence = distance from threshold
+        conf = np.abs(y_prob - threshold)
+        pred = (y_prob >= threshold).astype(int)
+        bins = np.linspace(0.0, max(threshold, 1.0 - threshold), n_bins + 1)
     correct = (pred == y_true).astype(float)
-    bins = np.linspace(0.5, 1.0, n_bins + 1)
     ece = 0.0
     for lo_b, hi_b in zip(bins[:-1], bins[1:]):
         mask = (conf >= lo_b) & (conf < hi_b)
